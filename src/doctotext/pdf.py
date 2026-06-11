@@ -32,6 +32,13 @@ class _TextChange:
     replacement_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PdfLine:
+    text: str
+    rects: list[fitz.Rect]
+    bbox: fitz.Rect
+
+
 class PdfExtractionMode(StrEnum):
     TEXT_LAYER = "text_layer"
 
@@ -52,7 +59,7 @@ class PdfDocument:
     def open_bytes(cls, data: bytes, *, filename: str = "document.pdf") -> PdfDocument:
         try:
             pdf = fitz.open(stream=data, filetype="pdf")
-            pages = [page.get_text("text") or "" for page in pdf]
+            pages = [_page_text_with_rects(page)[0] for page in pdf]
         except Exception as error:
             raise DocumentError("Nie udało się odczytać PDF.") from error
 
@@ -249,21 +256,58 @@ def _page_char_rects(page, source_text: str) -> list[fitz.Rect | None] | None:
 
 
 def _page_raw_text_with_rects(page) -> tuple[str, list[fitz.Rect | None]]:
+    return _page_text_with_rects(page)
+
+
+def _page_text_with_rects(page) -> tuple[str, list[fitz.Rect | None]]:
     text_parts: list[str] = []
     rects: list[fitz.Rect | None] = []
     raw = page.get_text("rawdict")
     for block in raw.get("blocks", []):
+        lines: list[_PdfLine] = []
         for line in block.get("lines", []):
-            line_has_text = False
+            line_text_parts: list[str] = []
+            line_rects: list[fitz.Rect] = []
             for span in line.get("spans", []):
                 for char in span.get("chars", []):
-                    text_parts.append(char.get("c", ""))
-                    rects.append(fitz.Rect(char["bbox"]))
-                    line_has_text = True
-            if line_has_text:
-                text_parts.append("\n")
+                    line_text_parts.append(char.get("c", ""))
+                    line_rects.append(fitz.Rect(char["bbox"]))
+            if not line_text_parts:
+                continue
+            lines.append(
+                _PdfLine(
+                    text="".join(line_text_parts),
+                    rects=line_rects,
+                    bbox=fitz.Rect(line["bbox"]),
+                )
+            )
+        for index, line in enumerate(lines):
+            if index:
+                previous = lines[index - 1]
+                separator = " " if _is_soft_wrapped_line(previous, line, page) else "\n"
+                text_parts.append(separator)
                 rects.append(None)
+            text_parts.append(line.text)
+            rects.extend(line.rects)
+        if lines:
+            text_parts.append("\n")
+            rects.append(None)
     return "".join(text_parts), rects
+
+
+def _is_soft_wrapped_line(previous: _PdfLine, current: _PdfLine, page) -> bool:
+    previous_text = previous.text.rstrip()
+    if not previous_text:
+        return False
+    if previous_text.endswith((".", "!", "?", ":", ";")):
+        return False
+
+    page_right = page.rect.x1
+    near_page_edge = previous.bbox.x1 >= page_right - 12
+    same_left_edge = abs(previous.bbox.x0 - current.bbox.x0) <= 24
+    long_previous_line = previous.bbox.width >= page.rect.width * 0.72
+
+    return near_page_edge or (same_left_edge and long_previous_line)
 
 
 def _rects_for_source_range(

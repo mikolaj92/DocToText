@@ -56,6 +56,16 @@ def _blank_pdf_bytes() -> bytes:
     return output.getvalue()
 
 
+def _positioned_pdf_bytes(*lines: str) -> bytes:
+    pdf = fitz.open()
+    page = pdf.new_page(width=595, height=842)
+    y = 100
+    for line in lines:
+        page.insert_text((48, y), line, fontsize=10)
+        y += 13
+    return pdf.tobytes()
+
+
 def _pdf_text(data: bytes) -> str:
     pdf = fitz.open(stream=data, filetype="pdf")
     return _normalize_text("\n".join(page.get_text("text") or "" for page in pdf))
@@ -138,6 +148,21 @@ def test_load_pdf_document_and_write_pdf_bytes() -> None:
     output_text = _pdf_text(output.data)
     assert "<PERSON>" in output_text
     assert "Jan Kowalski" not in output_text
+
+
+def test_load_pdf_joins_soft_wrapped_lines_with_space() -> None:
+    data = _positioned_pdf_bytes(
+        "X" * 20
+        + " Dane testowe obejmuja adres e-mail x, numer telefonu +48 514 222 333, rachun",
+        "1140 2004 0000 3102 1234 5678, pojazd KR 7MZ18.",
+    )
+
+    raw_text = fitz.open(stream=data, filetype="pdf")[0].get_text("text")
+    document = load_document("input.pdf", PDF_MIME, data)
+
+    assert "rachun\n1140" in raw_text
+    assert "rachun 1140" in document.texts[0]
+    assert "rachun\n1140" not in document.texts[0]
 
 
 def test_pdf_write_preserves_polish_text_and_page_count() -> None:
