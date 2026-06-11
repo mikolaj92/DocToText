@@ -228,6 +228,24 @@ def test_pdf_write_rebuilds_page_when_text_is_inserted() -> None:
     assert "Pierwsze zdanie. Drugie zdanie." in output_text
 
 
+def test_pdf_write_reflows_inserted_text_across_original_page_boundaries() -> None:
+    data = _pdf_bytes("Poczatek.", "Tresc z oryginalnej drugiej strony.")
+    document = load_document("input.pdf", PDF_MIME, data)
+    inserted_text = " ".join(f"dodatkowy{index}" for index in range(1, 1_501))
+    document.apply_texts(
+        [
+            document.texts[0].replace("Poczatek.", f"Poczatek. {inserted_text}"),
+            document.texts[1],
+        ]
+    )
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) > _pdf_page_count(data)
+    assert output_text.index("Poczatek") < output_text.index("Tresc z oryginalnej drugiej strony")
+    assert "dodatkowy1500" in output_text
+
+
 def test_pdf_write_rebuilds_page_when_replacement_is_longer() -> None:
     data = _pdf_bytes("Status: OK")
     document = load_document("input.pdf", PDF_MIME, data)
