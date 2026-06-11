@@ -24,6 +24,14 @@ UNICODE_FONT_CANDIDATES = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _TextChange:
+    source_start: int
+    source_end: int
+    source_text: str
+    replacement_text: str
+
+
 class PdfExtractionMode(StrEnum):
     TEXT_LAYER = "text_layer"
 
@@ -115,9 +123,19 @@ class PdfDocument:
 
 
 def _redact_page_changes(page, source_text: str, anonymized_text: str) -> bool:
+    changes = [
+        change
+        for change in _changed_text_spans(source_text, anonymized_text)
+        if change.source_text.strip()
+    ]
+    if not changes:
+        return True
+    if _redact_page_changes_by_offsets(page, source_text, changes):
+        return True
+
     added_redaction = False
-    for source_span, replacement_span in _changed_text_spans(source_text, anonymized_text):
-        source = source_span.strip()
+    for change in changes:
+        source = change.source_text.strip()
         if not source:
             continue
         if _unsafe_short_redaction_source(source):
@@ -127,7 +145,7 @@ def _redact_page_changes(page, source_text: str, anonymized_text: str) -> bool:
         if not rects:
             return False
 
-        label = _redaction_label(replacement_span)
+        label = _redaction_label(change.replacement_text)
         for rect in rects:
             expanded = _expand_rect(page, rect)
             page.add_redact_annot(
@@ -144,15 +162,149 @@ def _redact_page_changes(page, source_text: str, anonymized_text: str) -> bool:
     return True
 
 
-def _changed_text_spans(source_text: str, anonymized_text: str):
+def _redact_page_changes_by_offsets(
+    page,
+    source_text: str,
+    changes: list[_TextChange],
+) -> bool:
+    char_rects = _page_char_rects(page, source_text)
+    if char_rects is None:
+        return False
+
+    added_redaction = False
+    for change in changes:
+        source = change.source_text.strip()
+        if not source:
+            continue
+        if _unsafe_short_redaction_source(source):
+            return False
+
+        rects = _rects_for_source_range(
+            source_text,
+            char_rects,
+            start=change.source_start,
+            end=change.source_end,
+            page=page,
+        )
+        if not rects:
+            return False
+
+        label = _redaction_label(change.replacement_text)
+        for rect in rects:
+            page.add_redact_annot(
+                _expand_rect(page, rect),
+                text=label,
+                fill=(1, 1, 1),
+                text_color=(0, 0, 0),
+                fontsize=_redaction_font_size(rect),
+            )
+            added_redaction = True
+
+    if added_redaction:
+        page.apply_redactions()
+    return True
+
+
+def _changed_text_spans(source_text: str, anonymized_text: str) -> list[_TextChange]:
     matcher = SequenceMatcher(None, source_text, anonymized_text, autojunk=False)
+    changes: list[_TextChange] = []
     for tag, source_start, source_end, replacement_start, replacement_end in matcher.get_opcodes():
         if tag in {"equal", "insert"}:
             continue
-        yield (
-            source_text[source_start:source_end],
-            anonymized_text[replacement_start:replacement_end],
+        changes.append(
+            _TextChange(
+                source_start=source_start,
+                source_end=source_end,
+                source_text=source_text[source_start:source_end],
+                replacement_text=anonymized_text[replacement_start:replacement_end],
+            )
         )
+    return changes
+
+
+def _page_char_rects(page, source_text: str) -> list[fitz.Rect | None] | None:
+    raw_text, raw_rects = _page_raw_text_with_rects(page)
+    if raw_text == source_text:
+        return raw_rects
+
+    char_rects: list[fitz.Rect | None] = [None] * len(source_text)
+    matcher = SequenceMatcher(None, raw_text, source_text, autojunk=False)
+    matched_chars = 0
+    source_non_space = sum(not character.isspace() for character in source_text)
+    for tag, raw_start, raw_end, source_start, source_end in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for raw_index, source_index in zip(
+            range(raw_start, raw_end),
+            range(source_start, source_end),
+            strict=True,
+        ):
+            char_rects[source_index] = raw_rects[raw_index]
+            if not source_text[source_index].isspace() and raw_rects[raw_index] is not None:
+                matched_chars += 1
+
+    if source_non_space and matched_chars / source_non_space < 0.9:
+        return None
+    return char_rects
+
+
+def _page_raw_text_with_rects(page) -> tuple[str, list[fitz.Rect | None]]:
+    text_parts: list[str] = []
+    rects: list[fitz.Rect | None] = []
+    raw = page.get_text("rawdict")
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            line_has_text = False
+            for span in line.get("spans", []):
+                for char in span.get("chars", []):
+                    text_parts.append(char.get("c", ""))
+                    rects.append(fitz.Rect(char["bbox"]))
+                    line_has_text = True
+            if line_has_text:
+                text_parts.append("\n")
+                rects.append(None)
+    return "".join(text_parts), rects
+
+
+def _rects_for_source_range(
+    source_text: str,
+    char_rects: list[fitz.Rect | None],
+    *,
+    start: int,
+    end: int,
+    page,
+) -> list[fitz.Rect]:
+    rects: list[fitz.Rect] = []
+    for index in range(start, end):
+        if index >= len(char_rects):
+            return []
+        rect = char_rects[index]
+        if rect is None:
+            if source_text[index].isspace():
+                continue
+            return []
+        if source_text[index].isspace():
+            continue
+        rects.append(rect)
+
+    if not rects:
+        return []
+    return _merge_line_rects(rects, page)
+
+
+def _merge_line_rects(rects: list[fitz.Rect], page) -> list[fitz.Rect]:
+    merged: list[fitz.Rect] = []
+    for rect in sorted(rects, key=lambda item: (round(item.y0, 1), item.x0)):
+        if not merged or not _same_text_line(merged[-1], rect):
+            merged.append(fitz.Rect(rect))
+            continue
+        merged[-1].include_rect(rect)
+    return [_expand_rect(page, rect) for rect in merged]
+
+
+def _same_text_line(left: fitz.Rect, right: fitz.Rect) -> bool:
+    tolerance = max(2.0, min(left.height, right.height) * 0.45)
+    return abs(left.y0 - right.y0) <= tolerance or abs(left.y1 - right.y1) <= tolerance
 
 
 def _unsafe_short_redaction_source(text: str) -> bool:

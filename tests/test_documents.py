@@ -179,6 +179,17 @@ def test_pdf_write_keeps_original_page_count() -> None:
     assert "Anna Nowak" not in output_text
 
 
+def test_pdf_write_redacts_changed_occurrence_by_offset() -> None:
+    data = _pdf_bytes("Jan Kowalski oraz Jan Kowalski")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts([document.texts[0].replace("Jan Kowalski", "<PERSON>", 1)])
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert "<PERSON>" in output_text
+    assert output_text.count("Jan Kowalski") == 1
+
+
 def test_pdf_without_text_layer_requires_ocr() -> None:
     with pytest.raises(DocumentError, match="wymaga OCR"):
         load_document("scan.pdf", PDF_MIME, _blank_pdf_bytes())
