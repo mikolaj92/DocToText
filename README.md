@@ -16,7 +16,7 @@ Early library. The public API is small, but not stable yet.
 | --- | --- | --- | --- |
 | TXT/Markdown/text files | yes | same text format when known | Decodes UTF-8, UTF-16, CP1250, and Latin-1 fallback. |
 | DOCX | yes | DOCX | Edits WordprocessingML text nodes in place inside the package. |
-| PDF | text layer only | new text PDF | Does not preserve original visual layout. OCR is not bundled. |
+| PDF | text layer only | PDF | Applies redactions on original pages when changed text can be located. OCR is not bundled. |
 
 `load_document` detects the document kind from bytes first, then falls back to
 MIME type and file extension.
@@ -114,8 +114,10 @@ uv run pytest
 - Document layout can change when replacement text length changes.
 - PDF input must have a text layer. Scanned or image-only PDFs return an
   OCR-required error.
-- PDF output is a newly rendered text PDF, not a patch of the original PDF page
-  graphics.
+- PDF output keeps the original page graphics and page count when changed text
+  can be matched back to page rectangles.
+- If changed PDF text cannot be located safely, DocToText fails closed for that
+  page by replacing the page text instead of leaking the original text.
 
 ## License
 

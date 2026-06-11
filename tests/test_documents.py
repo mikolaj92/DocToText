@@ -4,9 +4,11 @@ from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 
+import fitz
 import pytest
-from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from test_docx import write_docx
 
@@ -23,11 +25,25 @@ from doctotext import (
     load_document,
 )
 
+UNICODE_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/local/share/fonts/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+)
 
-def _pdf_bytes(text: str) -> bytes:
+
+def _pdf_bytes(*pages: str, font_name: str = "Helvetica") -> bytes:
     output = BytesIO()
     pdf = canvas.Canvas(output, pagesize=A4)
-    pdf.drawString(48, 760, text)
+    pdf.setFont(font_name, 12)
+    for index, text in enumerate(pages):
+        if index:
+            pdf.showPage()
+            pdf.setFont(font_name, 12)
+        pdf.drawString(48, 760, text)
     pdf.save()
     return output.getvalue()
 
@@ -38,6 +54,31 @@ def _blank_pdf_bytes() -> bytes:
     pdf.showPage()
     pdf.save()
     return output.getvalue()
+
+
+def _pdf_text(data: bytes) -> str:
+    pdf = fitz.open(stream=data, filetype="pdf")
+    return _normalize_text("\n".join(page.get_text("text") or "" for page in pdf))
+
+
+def _pdf_page_count(data: bytes) -> int:
+    pdf = fitz.open(stream=data, filetype="pdf")
+    return pdf.page_count
+
+
+def _normalize_text(text: str) -> str:
+    return text.replace("\xa0", " ")
+
+
+def _unicode_font_name() -> str:
+    font_path = next((path for path in UNICODE_FONT_CANDIDATES if Path(path).exists()), None)
+    if font_path is None:
+        pytest.skip("Unicode font unavailable for PDF fixture")
+
+    font_name = "DocToTextTestUnicode"
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont(font_name, font_path))
+    return font_name
 
 
 def test_detects_docx_from_bytes_before_metadata(tmp_path: Path) -> None:
@@ -94,11 +135,48 @@ def test_load_pdf_document_and_write_pdf_bytes() -> None:
     assert output.filename == "input.anonimizowany.pdf"
     assert output.content_type == PDF_MIME
     assert output.data.startswith(b"%PDF")
-    output_text = "\n".join(
-        page.extract_text() or "" for page in PdfReader(BytesIO(output.data)).pages
-    )
+    output_text = _pdf_text(output.data)
     assert "<PERSON>" in output_text
     assert "Jan Kowalski" not in output_text
+
+
+def test_pdf_write_preserves_polish_text_and_page_count() -> None:
+    data = _pdf_bytes(
+        "Dane nie są fikcyjne. Zażółć gęślą jaźń. Jan Kowalski PESEL 44051401359",
+        font_name=_unicode_font_name(),
+    )
+    document = load_document("input.pdf", PDF_MIME, data)
+
+    assert "Dane nie są fikcyjne" in _normalize_text(document.texts[0])
+    assert "Zażółć gęślą jaźń" in _normalize_text(document.texts[0])
+
+    anonymized = (
+        document.texts[0]
+        .replace("Jan Kowalski", "****")
+        .replace("44051401359", "****")
+    )
+    document.apply_texts([anonymized])
+    output = document_to_bytes(document, "input.pdf")
+
+    output_text = _pdf_text(output.data)
+    assert _pdf_page_count(output.data) == _pdf_page_count(data)
+    assert "Dane nie są fikcyjne" in output_text
+    assert "Zażółć gęślą jaźń" in output_text
+    assert "Jan Kowalski" not in output_text
+    assert "44051401359" not in output_text
+
+
+def test_pdf_write_keeps_original_page_count() -> None:
+    data = _pdf_bytes("Jan Kowalski", "Anna Nowak")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts(["<PERSON>\n", "<PERSON>\n"])
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) == 2
+    assert "<PERSON>" in output_text
+    assert "Jan Kowalski" not in output_text
+    assert "Anna Nowak" not in output_text
 
 
 def test_pdf_without_text_layer_requires_ocr() -> None:
