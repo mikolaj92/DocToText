@@ -215,6 +215,44 @@ def test_pdf_write_redacts_changed_occurrence_by_offset() -> None:
     assert output_text.count("Jan Kowalski") == 1
 
 
+def test_pdf_write_rebuilds_page_when_text_is_inserted() -> None:
+    data = _pdf_bytes("Pierwsze zdanie.")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts(
+        [document.texts[0].replace("Pierwsze zdanie.", "Pierwsze zdanie. Drugie zdanie.")]
+    )
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) == 1
+    assert "Pierwsze zdanie. Drugie zdanie." in output_text
+
+
+def test_pdf_write_rebuilds_page_when_replacement_is_longer() -> None:
+    data = _pdf_bytes("Status: OK")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts([document.texts[0].replace("OK", "bardzo dobrze")])
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) == 1
+    assert "Status: bardzo dobrze" in output_text
+    assert "Status: OK" not in output_text
+
+
+def test_pdf_write_removes_deleted_text() -> None:
+    data = _pdf_bytes("Alpha Beta Gamma")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts([document.texts[0].replace("Beta ", "")])
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) == 1
+    assert "Alpha" in output_text
+    assert "Gamma" in output_text
+    assert "Beta" not in output_text
+
+
 def test_pdf_without_text_layer_requires_ocr() -> None:
     with pytest.raises(DocumentError, match="wymaga OCR"):
         load_document("scan.pdf", PDF_MIME, _blank_pdf_bytes())

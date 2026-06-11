@@ -112,6 +112,9 @@ class PdfDocument:
                     continue
 
                 page = pdf[page_index]
+                if _requires_page_text_rebuild(source_text, anonymized_text):
+                    _replace_page_with_text(page, anonymized_text)
+                    continue
                 if not _redact_page_changes(page, source_text, anonymized_text):
                     _replace_page_with_text(page, anonymized_text)
 
@@ -227,6 +230,54 @@ def _changed_text_spans(source_text: str, anonymized_text: str) -> list[_TextCha
             )
         )
     return changes
+
+
+def _requires_page_text_rebuild(source_text: str, target_text: str) -> bool:
+    redaction_target = _looks_like_redaction_target(target_text)
+    if len(target_text) > len(source_text) and not redaction_target:
+        return True
+
+    matcher = SequenceMatcher(None, source_text, target_text, autojunk=False)
+    for tag, source_start, source_end, target_start, target_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert" and not redaction_target:
+            return True
+
+        source = source_text[source_start:source_end]
+        replacement = target_text[target_start:target_end]
+        if tag == "delete" and not redaction_target and source.strip():
+            return True
+        if tag == "replace" and _replacement_requires_reflow(
+            source,
+            replacement,
+            redaction_target=redaction_target,
+        ):
+            return True
+    return False
+
+
+def _looks_like_redaction_target(text: str) -> bool:
+    return "****" in text or ("<" in text and ">" in text)
+
+
+def _replacement_requires_reflow(
+    source: str,
+    replacement: str,
+    *,
+    redaction_target: bool,
+) -> bool:
+    if redaction_target:
+        return False
+    source_label = " ".join(source.split())
+    replacement_label = " ".join(replacement.split())
+    if not replacement_label:
+        return False
+    if len(replacement_label) > len(source_label):
+        return True
+    if any(ord(character) > 127 for character in replacement_label):
+        return True
+    return "\n" in replacement and "\n" not in source
 
 
 def _page_char_rects(page, source_text: str) -> list[fitz.Rect | None] | None:
