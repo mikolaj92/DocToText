@@ -204,6 +204,49 @@ def test_pdf_write_keeps_original_page_count() -> None:
     assert "Anna Nowak" not in output_text
 
 
+def test_pdf_reflow_keeps_each_page_on_its_own_page() -> None:
+    # A longer, non-redaction replacement forces the reflow renderer. It must reflow
+    # within each original page (form-feed boundaries) instead of merging the whole
+    # document into a single continuous stream, which collapsed the page count.
+    data = _pdf_bytes("Pierwsza strona.", "Druga strona.", "Trzecia strona.")
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts(
+        [
+            document.texts[0].replace("Pierwsza strona.", "Pierwsza strona z dluzszym opisem."),
+            document.texts[1],
+            document.texts[2],
+        ]
+    )
+    output = document_to_bytes(document, "input.pdf")
+    output_text = _pdf_text(output.data)
+
+    assert _pdf_page_count(output.data) == 3
+    assert "Pierwsza strona z dluzszym opisem." in output_text
+    assert "Trzecia strona." in output_text
+
+
+def test_pdf_label_redaction_is_in_place_and_keeps_labels_whole() -> None:
+    # Replacing a PII span with a longer bracketed label must redact in place: the
+    # surrounding lines stay byte-for-byte intact (not re-rendered with NBSP), and the
+    # placeholder is written whole, not fragmented by coincidental character matches
+    # between the source ("Adres 41") and the placeholder ("[ADRES_1]").
+    lines = ["Pewien Adres 41 w dokumencie."]
+    lines += [f"Wiersz tekstu numer {index} bez zmian." for index in range(1, 12)]
+    data = _positioned_pdf_bytes(*lines)
+    document = load_document("input.pdf", PDF_MIME, data)
+    document.apply_texts([document.texts[0].replace("Adres 41", "[ADRES_1]")])
+    output = document_to_bytes(document, "input.pdf")
+
+    raw_output = "\n".join(
+        page.get_text("text") for page in fitz.open(stream=output.data, filetype="pdf")
+    )
+
+    assert _pdf_page_count(output.data) == 1
+    assert "[ADRES_1]" in raw_output
+    assert "Adres 41" not in raw_output
+    assert "Wiersz tekstu numer 7 bez zmian." in raw_output
+
+
 def test_pdf_write_redacts_changed_occurrence_by_offset() -> None:
     data = _pdf_bytes("Jan Kowalski oraz Jan Kowalski")
     document = load_document("input.pdf", PDF_MIME, data)
