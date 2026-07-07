@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -45,6 +46,21 @@ RELS = """<?xml version="1.0" encoding="UTF-8"?>
     Target="word/document.xml"/>
 </Relationships>
 """
+
+
+MULTI_NS_DOC_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    "<w:document "
+    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
+    'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
+    'mc:Ignorable="w14 wp14">'
+    "<w:body>"
+    '<w:p><w:hyperlink r:id="rId1"><w:r><w:t>Jan Kowalski</w:t></w:r></w:hyperlink></w:p>'
+    "</w:body></w:document>"
+)
 
 
 def write_docx(path: Path) -> None:
@@ -118,6 +134,29 @@ def test_applies_markdown_with_segment_markers(tmp_path: Path) -> None:
 
     document_xml = read_part(output_path, "word/document.xml")
     assert "Second changed" in document_xml
+
+
+def test_to_bytes_preserves_root_namespace_declarations(tmp_path: Path) -> None:
+    path = tmp_path / "input.docx"
+    with ZipFile(path, "w") as docx:
+        docx.writestr("[Content_Types].xml", CONTENT_TYPES)
+        docx.writestr("_rels/.rels", RELS)
+        docx.writestr("word/document.xml", MULTI_NS_DOC_XML)
+
+    doc = DocxDocument.open_bytes(path.read_bytes())
+    doc.apply_texts(["****"])
+
+    with ZipFile(BytesIO(doc.to_bytes())) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+
+    root = document_xml[document_xml.index("<w:document") :]
+    root = root[: root.index(">") + 1]
+    # mc:Ignorable references these prefixes; dropping their xmlns breaks Word.
+    assert 'mc:Ignorable="w14 wp14"' in root
+    assert 'xmlns:w14="' in root
+    assert 'xmlns:wp14="' in root
+    # The relationship-linked run must keep a declaration for its prefix.
+    assert "relationships" in root
 
 
 def test_rejects_wrong_number_of_texts(tmp_path: Path) -> None:

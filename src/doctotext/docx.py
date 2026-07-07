@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import re
 from collections.abc import Iterable
@@ -22,6 +23,7 @@ MARKER_RE = re.compile(
     r"<!-- doctotext:(?P<id>s\d+) -->\n(?P<text>.*?)(?=\n<!-- doctotext:s\d+ -->\n|\Z)",
     re.DOTALL,
 )
+XMLNS_RE = re.compile(rb'xmlns(?::([\w.\-]+))?="([^"]*)"')
 
 ET.register_namespace("w", W_NS)
 ET.register_namespace("xml", XML_NS)
@@ -197,11 +199,7 @@ class DocxDocument:
                 info.compress_type = self._zip_infos[name].compress_type
 
                 if name in self._parts and self._parts[name].dirty:
-                    data = ET.tostring(
-                        self._parts[name].root,
-                        encoding="utf-8",
-                        xml_declaration=True,
-                    )
+                    data = _serialize_part(self._parts[name].root, data)
 
                 output.writestr(info, data)
         return output_bytes.getvalue()
@@ -231,3 +229,56 @@ class DocxDocument:
 def _ensure_space_preserved(node: ET.Element, text: str) -> None:
     if text and (text[0].isspace() or text[-1].isspace()):
         node.set(XML_SPACE, "preserve")
+
+
+def _serialize_part(root: ET.Element, original: bytes) -> bytes:
+    """Serialize a modified XML part without losing root namespaces.
+
+    ElementTree only re-emits namespace declarations for prefixes that appear in
+    element or attribute *names*. Prefixes referenced solely in attribute values
+    -- most importantly the markup-compatibility hints ``mc:Ignorable="w14 wp14"``
+    and ``mc:Choice Requires="..."`` -- lose their ``xmlns`` declaration, which
+    makes Word reject the file. We keep the original prefixes and re-add any
+    declaration ElementTree dropped.
+    """
+    namespaces = _root_namespace_decls(original)
+    for prefix, uri in namespaces.items():
+        # ValueError => reserved prefix (e.g. ns\d+); leave ElementTree's default.
+        with contextlib.suppress(ValueError):
+            ET.register_namespace(prefix.decode(), uri.decode())
+    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return _restore_namespace_decls(data, namespaces)
+
+
+def _root_namespace_decls(xml: bytes) -> dict[bytes, bytes]:
+    start = _root_tag_start(xml)
+    tag_end = xml.find(b">", start)
+    if start == -1 or tag_end == -1:
+        return {}
+    return dict(XMLNS_RE.findall(xml[start:tag_end]))
+
+
+def _restore_namespace_decls(xml: bytes, namespaces: dict[bytes, bytes]) -> bytes:
+    start = _root_tag_start(xml)
+    tag_end = xml.find(b">", start)
+    if start == -1 or tag_end == -1:
+        return xml
+    name_end = start + 1
+    while name_end < tag_end and xml[name_end] not in b" \t\n\r>/":
+        name_end += 1
+    present = {prefix for prefix, _ in XMLNS_RE.findall(xml[start:tag_end])}
+    missing = b"".join(
+        b' xmlns:%s="%s"' % (prefix, uri) if prefix else b' xmlns="%s"' % uri
+        for prefix, uri in namespaces.items()
+        if prefix not in present
+    )
+    if not missing:
+        return xml
+    return xml[:name_end] + missing + xml[name_end:]
+
+
+def _root_tag_start(xml: bytes) -> int:
+    start = xml.find(b"<")
+    if start != -1 and xml[start : start + 2] == b"<?":
+        return xml.find(b"<", xml.find(b"?>", start) + 2)
+    return start
