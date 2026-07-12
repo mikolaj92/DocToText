@@ -126,3 +126,33 @@ uv run pytest
 ## License
 
 MIT
+
+## High-fidelity DOCX editing
+
+For advanced use cases (reversible redaction, reinjection, structured plans):
+
+```python
+from doctotext import DocxDocument
+
+doc = DocxDocument.open("input.docx")
+
+# Stable container addressing
+print([s.container_id for s in doc.segments])
+# ['body:p:0', 'body:p:1', 'header:0', ...]
+
+# Structured replacement using container_id (preferred)
+doc.apply_replacements([
+    {"container_id": "body:p:0", "text": "New first paragraph"},
+], strict=True)
+
+# Or by internal id
+doc.apply_replacements([
+    {"id": "s0", "text": "Replacement"},
+], strict=True)
+
+doc.save_docx("output.docx")
+```
+
+`apply_replacements(..., strict=True)` will raise on unknown targets or structural drift.
+
+Existing `apply_texts` and `apply_markdown` remain supported.

@@ -35,6 +35,8 @@ class TextSegment:
     text: str
     part: str
     index: int
+    container_id: str
+    paragraph_index: int
 
 
 @dataclass
@@ -57,6 +59,9 @@ class DocxDocument:
 
     The original DOCX archive is kept as the source of truth. Applying text edits
     changes only `w:t` text nodes inside known Word XML story parts.
+
+    Segments are addressable by stable container_id (e.g. "body:p:17",
+    "header:0", "table:0:r:2:c:1" style in future) in addition to the internal id.
     """
 
     def __init__(
@@ -93,6 +98,8 @@ class DocxDocument:
         segments: list[TextSegment] = []
         refs: list[_SegmentRef] = []
 
+        body_paragraph_index = 0
+
         for name, data in archive.items():
             if not TEXT_PART_RE.match(name):
                 continue
@@ -104,6 +111,7 @@ class DocxDocument:
 
             part = _XmlPart(name=name, root=root)
             part_segment_index = 0
+
             for paragraph in root.iter(W_P):
                 text_nodes = [node for node in paragraph.iter(W_T)]
                 if not text_nodes:
@@ -114,19 +122,39 @@ class DocxDocument:
                     continue
 
                 segment_id = f"s{len(segments)}"
+
+                # Compute stable container_id
+                if name == "word/document.xml":
+                    container_id = f"body:p:{body_paragraph_index}"
+                    paragraph_index = body_paragraph_index
+                    body_paragraph_index += 1
+                elif name.startswith("word/header"):
+                    num = "".join(c for c in name if c.isdigit()) or "0"
+                    container_id = f"header:{num}"
+                    paragraph_index = part_segment_index
+                elif name.startswith("word/footer"):
+                    num = "".join(c for c in name if c.isdigit()) or "0"
+                    container_id = f"footer:{num}"
+                    paragraph_index = part_segment_index
+                else:
+                    container_id = name.replace("word/", "").replace(".xml", "")
+                    paragraph_index = part_segment_index
+
                 segments.append(
                     TextSegment(
                         id=segment_id,
                         text=text,
                         part=name,
                         index=part_segment_index,
+                        container_id=container_id,
+                        paragraph_index=paragraph_index,
                     )
                 )
                 refs.append(
                     _SegmentRef(
                         id=segment_id,
                         part=name,
-                        paragraph_index=part_segment_index,
+                        paragraph_index=paragraph_index,
                         text_nodes=text_nodes,
                     )
                 )
@@ -156,13 +184,45 @@ class DocxDocument:
             blocks.append(f"<!-- doctotext:{segment.id} -->\n{segment.text}")
         return "\n\n".join(blocks)
 
-    def apply_texts(self, texts: Iterable[str]) -> None:
+    def apply_texts(self, texts: Iterable[str], *, strict: bool = False) -> None:
         texts = list(texts)
         if len(texts) != len(self._segments):
             raise ValueError(f"expected {len(self._segments)} text segments, got {len(texts)}")
 
         for index, text in enumerate(texts):
             self._apply_segment_text(index, text)
+
+    def apply_replacements(
+        self,
+        replacements: list[dict[str, str | int]],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Apply replacements using stable identifiers.
+
+        Each replacement is a dict with one of:
+          - {"container_id": "body:p:17", "text": "new text"}
+          - {"id": "s3", "text": "new text"}
+
+        When strict=True, unknown container_ids/ids raise ValueError.
+        """
+        by_container = {seg.container_id: i for i, seg in enumerate(self._segments)}
+        by_id = {seg.id: i for i, seg in enumerate(self._segments)}
+
+        for rep in replacements:
+            idx = None
+            if "container_id" in rep:
+                idx = by_container.get(str(rep["container_id"]))
+            elif "id" in rep:
+                idx = by_id.get(str(rep["id"]))
+
+            if idx is None:
+                if strict:
+                    key = rep.get("container_id") or rep.get("id")
+                    raise ValueError(f"unknown replacement target: {key}")
+                continue
+
+            self._apply_segment_text(idx, str(rep["text"]))
 
     def apply_markdown(self, markdown: str, *, strict: bool = True) -> None:
         by_id = {
@@ -223,7 +283,14 @@ class DocxDocument:
             _ensure_space_preserved(node, chunk)
 
         self._parts[ref.part].dirty = True
-        self._segments[index] = replace(self._segments[index], text=text)
+        # preserve stable fields
+        old = self._segments[index]
+        self._segments[index] = replace(
+            old,
+            text=text,
+            container_id=old.container_id,
+            paragraph_index=old.paragraph_index,
+        )
 
 
 def _ensure_space_preserved(node: ET.Element, text: str) -> None:
