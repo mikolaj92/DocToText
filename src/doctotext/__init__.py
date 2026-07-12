@@ -8,7 +8,7 @@ from .common import (
     DocumentKind,
 )
 from .detection import DetectedDocumentType, detect_document_type
-from .docx import DocxDocument, TextSegment
+from .docx import DocxDocument, SegmentReplacement, TextSegment
 from .loader import document_to_bytes, load_document
 from .pdf import PdfDocument, PdfExtractionMode
 from .text import PlainTextDocument
@@ -21,11 +21,11 @@ __all__ = [
     "DocumentBytes",
     "DocumentError",
     "DocumentKind",
-    "DetectedDocumentType",
     "DocxDocument",
     "PdfExtractionMode",
     "PdfDocument",
     "PlainTextDocument",
+    "SegmentReplacement",
     "TextSegment",
     "detect_document_type",
     "document_to_bytes",

@@ -1,174 +1,160 @@
 from __future__ import annotations
 
-import contextlib
 import copy
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from xml.etree import ElementTree as ET
-from zipfile import ZipFile, ZipInfo
+from typing import Any
+from zipfile import ZipFile
+
+from docx import Document as PyDocxDocument
+from docx.document import Document as DocxDocumentType
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-XML_NS = "http://www.w3.org/XML/1998/namespace"
-W_P = f"{{{W_NS}}}p"
-W_T = f"{{{W_NS}}}t"
-XML_SPACE = f"{{{XML_NS}}}space"
-
-TEXT_PART_RE = re.compile(
-    r"^word/(?:document|header\d+|footer\d+|footnotes|endnotes|comments)\.xml$"
-)
-MARKER_RE = re.compile(
-    r"<!-- doctotext:(?P<id>s\d+) -->\n(?P<text>.*?)(?=\n<!-- doctotext:s\d+ -->\n|\Z)",
-    re.DOTALL,
-)
-XMLNS_RE = re.compile(rb'xmlns(?::([\w.\-]+))?="([^"]*)"')
-
-ET.register_namespace("w", W_NS)
-ET.register_namespace("xml", XML_NS)
+W_P = qn("w:p")
+W_R = qn("w:r")
+W_T = qn("w:t")
 
 
 @dataclass(frozen=True)
 class TextSegment:
+    """Stable textual segment inside a DOCX.
+
+    container_id examples:
+      body:p:0
+      header:0
+      table:0:r:0:c:0:p:0   (for table cells)
+    paragraph_index is the global order index (body + tables + headers/footers).
+    """
+
     id: str
     text: str
     part: str
     index: int
+    container_id: str | None = None
+    paragraph_index: int | None = None
+
+
+@dataclass(frozen=True)
+class SegmentReplacement:
+    """Replacement targeting a segment or a sub-range inside it.
+
+    Offsets are in characters of the segment's text.
+    If start_offset and end_offset are None -> whole segment.
+    """
+
+    container_id: str | None = None
+    id: str | None = None
+    text: str = ""
+    start_offset: int | None = None
+    end_offset: int | None = None
+
+
+@dataclass
+class _ParaRef:
+    """Internal mapping from our segment to python-docx paragraph + metadata."""
+
+    id: str
     container_id: str
     paragraph_index: int
-
-
-@dataclass
-class _SegmentRef:
-    id: str
-    part: str
-    paragraph_index: int
-    text_nodes: list[ET.Element]
-
-
-@dataclass
-class _XmlPart:
-    name: str
-    root: ET.Element
-    dirty: bool = False
+    paragraph: Paragraph
+    part_name: str  # "body", "header:0", "table:0:r:0:c:0", etc.
 
 
 class DocxDocument:
-    """Editable text view over a DOCX file.
+    """DOCX editing surface backed by python-docx (the proper library for the format).
 
-    The original DOCX archive is kept as the source of truth. Applying text edits
-    changes only `w:t` text nodes inside known Word XML story parts.
-
-    Segments are addressable by stable container_id (e.g. "body:p:17",
-    "header:0", "table:0:r:2:c:1" style in future) in addition to the internal id.
+    - Stable container_id + paragraph_index addressing.
+    - Whole segment or offset-based partial replacements (run splitting).
+    - Preserves formatting because we operate on runs.
+    - Roundtrips via python-docx save.
     """
 
     def __init__(
         self,
-        archive: dict[str, bytes],
-        zip_infos: dict[str, ZipInfo],
-        parts: dict[str, _XmlPart],
+        doc: DocxDocumentType,
         segments: list[TextSegment],
-        refs: list[_SegmentRef],
+        refs: list[_ParaRef],
     ) -> None:
-        self._archive = archive
-        self._zip_infos = zip_infos
-        self._parts = parts
+        self._doc = doc
         self._segments = segments
-        self._refs = refs
+        self._refs = refs  # index-aligned with segments
 
     @classmethod
     def open(cls, path: str | Path) -> DocxDocument:
         path = Path(path)
-        with ZipFile(path) as docx:
-            return cls._open_zip(docx)
+        doc = PyDocxDocument(str(path))
+        return cls._from_pydocx(doc)
 
     @classmethod
     def open_bytes(cls, data: bytes) -> DocxDocument:
-        with ZipFile(BytesIO(data)) as docx:
-            return cls._open_zip(docx)
+        doc = PyDocxDocument(BytesIO(data))
+        return cls._from_pydocx(doc)
 
     @classmethod
-    def _open_zip(cls, docx: ZipFile) -> DocxDocument:
-        archive = {name: docx.read(name) for name in docx.namelist()}
-        zip_infos = {info.filename: copy.copy(info) for info in docx.infolist()}
-
-        parts: dict[str, _XmlPart] = {}
+    def _from_pydocx(cls, doc: DocxDocumentType) -> DocxDocument:
         segments: list[TextSegment] = []
-        refs: list[_SegmentRef] = []
+        refs: list[_ParaRef] = []
 
-        body_paragraph_index = 0
+        paragraph_index = 0
 
-        for name, data in archive.items():
-            if not TEXT_PART_RE.match(name):
-                continue
-
-            try:
-                root = ET.fromstring(data)
-            except ET.ParseError:
-                continue
-
-            part = _XmlPart(name=name, root=root)
-            part_segment_index = 0
-
-            for paragraph in root.iter(W_P):
-                text_nodes = [node for node in paragraph.iter(W_T)]
-                if not text_nodes:
+        def add_paragraphs(paragraphs: list[Paragraph], prefix: str) -> None:
+            nonlocal paragraph_index
+            for local_idx, para in enumerate(paragraphs):
+                text = "".join(run.text for run in para.runs)
+                if not text:
+                    # still count for paragraph_index stability (same as dike/posejdon)
+                    paragraph_index += 1
                     continue
 
-                text = "".join(node.text or "" for node in text_nodes)
-                if text == "":
-                    continue
-
-                segment_id = f"s{len(segments)}"
-
-                # Compute stable container_id
-                if name == "word/document.xml":
-                    container_id = f"body:p:{body_paragraph_index}"
-                    paragraph_index = body_paragraph_index
-                    body_paragraph_index += 1
-                elif name.startswith("word/header"):
-                    num = "".join(c for c in name if c.isdigit()) or "0"
-                    container_id = f"header:{num}"
-                    paragraph_index = part_segment_index
-                elif name.startswith("word/footer"):
-                    num = "".join(c for c in name if c.isdigit()) or "0"
-                    container_id = f"footer:{num}"
-                    paragraph_index = part_segment_index
+                container_id = f"{prefix}:p:{local_idx}" if prefix != "body" else f"body:p:{paragraph_index}"
+                # For body we use global paragraph_index to match previous contract
+                if prefix == "body":
+                    cid = f"body:p:{paragraph_index}"
                 else:
-                    container_id = name.replace("word/", "").replace(".xml", "")
-                    paragraph_index = part_segment_index
+                    cid = f"{prefix}:p:{local_idx}"
+
+                seg_id = f"s{len(segments)}"
 
                 segments.append(
                     TextSegment(
-                        id=segment_id,
+                        id=seg_id,
                         text=text,
-                        part=name,
-                        index=part_segment_index,
-                        container_id=container_id,
+                        part="word/document.xml" if prefix.startswith("body") or prefix.startswith("table") else f"word/{prefix.split(':')[0]}.xml",
+                        index=local_idx,
+                        container_id=cid,
                         paragraph_index=paragraph_index,
                     )
                 )
                 refs.append(
-                    _SegmentRef(
-                        id=segment_id,
-                        part=name,
+                    _ParaRef(
+                        id=seg_id,
+                        container_id=cid,
                         paragraph_index=paragraph_index,
-                        text_nodes=text_nodes,
+                        paragraph=para,
+                        part_name=prefix,
                     )
                 )
-                part_segment_index += 1
+                paragraph_index += 1
 
-            parts[name] = part
+        # Body paragraphs
+        add_paragraphs(list(doc.paragraphs), "body")
 
-        return cls(
-            archive=archive,
-            zip_infos=zip_infos,
-            parts=parts,
-            segments=segments,
-            refs=refs,
-        )
+        # Tables (cell paragraphs)
+        for ti, table in enumerate(doc.tables):
+            for ri, row in enumerate(table.rows):
+                for ci, cell in enumerate(row.cells):
+                    add_paragraphs(list(cell.paragraphs), f"table:{ti}:r:{ri}:c:{ci}")
+
+        # Headers / Footers
+        for si, section in enumerate(doc.sections):
+            add_paragraphs(list(section.header.paragraphs), f"header:{si}")
+            add_paragraphs(list(section.footer.paragraphs), f"footer:{si}")
+
+        return cls(doc=doc, segments=segments, refs=refs)
 
     @property
     def segments(self) -> tuple[TextSegment, ...]:
@@ -176,40 +162,41 @@ class DocxDocument:
 
     @property
     def texts(self) -> list[str]:
-        return [segment.text for segment in self._segments]
+        return [s.text for s in self._segments]
 
     def to_markdown(self) -> str:
-        blocks = []
-        for segment in self._segments:
-            blocks.append(f"<!-- doctotext:{segment.id} -->\n{segment.text}")
+        blocks = [f"<!-- doctotext:{s.id} -->\n{s.text}" for s in self._segments]
         return "\n\n".join(blocks)
+
+    # ------------------------------------------------------------------
+    # Replacement API (supports full + offset ranges via python-docx)
+    # ------------------------------------------------------------------
 
     def apply_texts(self, texts: Iterable[str], *, strict: bool = False) -> None:
         texts = list(texts)
         if len(texts) != len(self._segments):
-            raise ValueError(f"expected {len(self._segments)} text segments, got {len(texts)}")
-
-        for index, text in enumerate(texts):
-            self._apply_segment_text(index, text)
+            raise ValueError(f"expected {len(self._segments)} segments, got {len(texts)}")
+        for i, txt in enumerate(texts):
+            self._replace_full_segment(i, txt)
 
     def apply_replacements(
         self,
-        replacements: list[dict[str, str | int]],
+        replacements: list[dict[str, Any] | SegmentReplacement],
         *,
         strict: bool = False,
     ) -> None:
-        """Apply replacements using stable identifiers.
-
-        Each replacement is a dict with one of:
-          - {"container_id": "body:p:17", "text": "new text"}
-          - {"id": "s3", "text": "new text"}
-
-        When strict=True, unknown container_ids/ids raise ValueError.
-        """
-        by_container = {seg.container_id: i for i, seg in enumerate(self._segments)}
-        by_id = {seg.id: i for i, seg in enumerate(self._segments)}
+        by_container = {r.container_id: i for i, r in enumerate(self._segments)}
+        by_id = {r.id: i for i, r in enumerate(self._segments)}
 
         for rep in replacements:
+            if isinstance(rep, SegmentReplacement):
+                idx = self._find_index(rep, by_container, by_id, strict)
+                if idx is None:
+                    continue
+                self._apply_to_paragraph(idx, rep.text, rep.start_offset, rep.end_offset)
+                continue
+
+            # legacy / dict form
             idx = None
             if "container_id" in rep:
                 idx = by_container.get(str(rep["container_id"]))
@@ -218,134 +205,163 @@ class DocxDocument:
 
             if idx is None:
                 if strict:
-                    key = rep.get("container_id") or rep.get("id")
-                    raise ValueError(f"unknown replacement target: {key}")
+                    raise ValueError(f"unknown target: {rep.get('container_id') or rep.get('id')}")
                 continue
 
-            self._apply_segment_text(idx, str(rep["text"]))
+            text = str(rep.get("text", ""))
+            start = rep.get("start_offset")
+            end = rep.get("end_offset")
+            self._apply_to_paragraph(idx, text, start, end)
 
     def apply_markdown(self, markdown: str, *, strict: bool = True) -> None:
+        import re as _re
         by_id = {
-            match.group("id"): match.group("text").rstrip("\n")
-            for match in MARKER_RE.finditer(markdown)
+            m.group("id"): m.group("text").rstrip("\n")
+            for m in _re.finditer(r"<!-- doctotext:(?P<id>s\d+) -->\n(?P<text>.*?)(?=\n<!-- doctotext:s\d+ -->\n|\Z)", markdown, _re.DOTALL)
         }
-
         if strict:
-            expected = {segment.id for segment in self._segments}
-            actual = set(by_id)
+            expected = {s.id for s in self._segments}
+            actual = set(by_id.keys())
             missing = sorted(expected - actual)
             unknown = sorted(actual - expected)
             if missing or unknown:
-                details = []
-                if missing:
-                    details.append(f"missing: {', '.join(missing)}")
-                if unknown:
-                    details.append(f"unknown: {', '.join(unknown)}")
-                raise ValueError("invalid doctotext markdown markers; " + "; ".join(details))
+                raise ValueError(f"markdown marker mismatch; missing={missing} unknown={unknown}")
 
-        for index, segment in enumerate(self._segments):
-            if segment.id in by_id:
-                self._apply_segment_text(index, by_id[segment.id])
+        for i, seg in enumerate(self._segments):
+            if seg.id in by_id:
+                self._replace_full_segment(i, by_id[seg.id])
+
+    # ------------------------------------------------------------------
+    # Save / bytes
+    # ------------------------------------------------------------------
 
     def save_docx(self, path: str | Path) -> None:
-        path = Path(path)
-        path.write_bytes(self.to_bytes())
+        self._doc.save(str(path))
 
     def to_bytes(self) -> bytes:
-        output_bytes = BytesIO()
-        with ZipFile(output_bytes, "w") as output:
-            for name, data in self._archive.items():
-                info = copy.copy(self._zip_infos[name])
-                info.compress_type = self._zip_infos[name].compress_type
+        buf = BytesIO()
+        self._doc.save(buf)
+        return buf.getvalue()
 
-                if name in self._parts and self._parts[name].dirty:
-                    data = _serialize_part(self._parts[name].root, data)
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-                output.writestr(info, data)
-        return output_bytes.getvalue()
-
-    def _apply_segment_text(self, index: int, text: str) -> None:
-        ref = self._refs[index]
-        lengths = [len(node.text or "") for node in ref.text_nodes]
-
-        if len(ref.text_nodes) == 1:
-            chunks = [text]
+    def _find_index(
+        self,
+        rep: SegmentReplacement,
+        by_container: dict[str, int],
+        by_id: dict[str, int],
+        strict: bool,
+    ) -> int | None:
+        if rep.container_id:
+            idx = by_container.get(str(rep.container_id))
+        elif rep.id:
+            idx = by_id.get(str(rep.id))
         else:
-            chunks = []
-            offset = 0
-            for length in lengths[:-1]:
-                chunks.append(text[offset : offset + length])
-                offset += length
-            chunks.append(text[offset:])
+            idx = None
+        if idx is None and strict:
+            raise ValueError(f"unknown replacement target: {rep.container_id or rep.id}")
+        return idx
 
-        for node, chunk in zip(ref.text_nodes, chunks, strict=True):
-            node.text = chunk
-            _ensure_space_preserved(node, chunk)
-
-        self._parts[ref.part].dirty = True
-        # preserve stable fields
+    def _replace_full_segment(self, index: int, text: str) -> None:
+        ref = self._refs[index]
+        para = ref.paragraph
+        if not para.runs:
+            # create one run
+            run = para.add_run(text)
+        else:
+            # replace first run, clear the rest (preserves some formatting on first run)
+            para.runs[0].text = text
+            for run in para.runs[1:]:
+                run.text = ""
+        # update our view
         old = self._segments[index]
-        self._segments[index] = replace(
-            old,
-            text=text,
-            container_id=old.container_id,
-            paragraph_index=old.paragraph_index,
-        )
+        self._segments[index] = replace(old, text=text)
+
+    def _apply_to_paragraph(
+        self,
+        index: int,
+        replacement: str,
+        start: int | None,
+        end: int | None,
+    ) -> None:
+        ref = self._refs[index]
+        para = ref.paragraph
+        full = "".join(r.text for r in para.runs)
+        s = 0 if start is None else start
+        e = len(full) if end is None else end
+
+        if s == 0 and e == len(full):
+            self._replace_full_segment(index, replacement)
+            return
+
+        # Use run-range logic (adapted from proven posejdon docx_runs)
+        ranges = self._build_run_ranges(para)
+        # split boundaries (right first)
+        for r in reversed(ranges):
+            if r[1] < e < r[2]:
+                self._split_run(para, r[0], e - r[1])
+                break
+        ranges = self._build_run_ranges(para)
+        for r in reversed(ranges):
+            if r[1] < s < r[2]:
+                self._split_run(para, r[0], s - r[1])
+                break
+
+        # now replace the affected runs
+        ranges = self._build_run_ranges(para)
+        affected = [r for r in ranges if r[1] >= s and r[2] <= e and r[2] > r[1]]
+        if not affected:
+            # fallback
+            self._replace_full_segment(index, replacement)
+            return
+
+        first = True
+        for r in affected:
+            run = para.runs[r[0]]
+            if first:
+                run.text = replacement
+                first = False
+            else:
+                run.text = ""
+
+        # refresh our segment text
+        new_text = "".join(r.text for r in para.runs)
+        old = self._segments[index]
+        self._segments[index] = replace(old, text=new_text)
+
+    def _build_run_ranges(self, paragraph: Paragraph) -> list[tuple[int, int, int]]:
+        out: list[tuple[int, int, int]] = []
+        cur = 0
+        for i, run in enumerate(paragraph.runs):
+            ln = len(run.text)
+            out.append((i, cur, cur + ln))
+            cur += ln
+        return out
+
+    def _split_run(self, paragraph: Paragraph, run_index: int, offset: int) -> int:
+        if offset <= 0:
+            return run_index
+        run = paragraph.runs[run_index]
+        if offset >= len(run.text):
+            return run_index + 1
+        left = run.text[:offset]
+        right = run.text[offset:]
+        run.text = left
+
+        # clone the underlying XML element
+        cloned = copy.deepcopy(run._element)
+        run._element.addnext(cloned)
+
+        new_run = paragraph.runs[run_index + 1]
+        new_run.text = right
+        return run_index + 1
 
 
-def _ensure_space_preserved(node: ET.Element, text: str) -> None:
-    if text and (text[0].isspace() or text[-1].isspace()):
-        node.set(XML_SPACE, "preserve")
+# ----------------------------------------------------------------------
+# Helper to expose for advanced users if needed
+# ----------------------------------------------------------------------
 
-
-def _serialize_part(root: ET.Element, original: bytes) -> bytes:
-    """Serialize a modified XML part without losing root namespaces.
-
-    ElementTree only re-emits namespace declarations for prefixes that appear in
-    element or attribute *names*. Prefixes referenced solely in attribute values
-    -- most importantly the markup-compatibility hints ``mc:Ignorable="w14 wp14"``
-    and ``mc:Choice Requires="..."`` -- lose their ``xmlns`` declaration, which
-    makes Word reject the file. We keep the original prefixes and re-add any
-    declaration ElementTree dropped.
-    """
-    namespaces = _root_namespace_decls(original)
-    for prefix, uri in namespaces.items():
-        # ValueError => reserved prefix (e.g. ns\d+); leave ElementTree's default.
-        with contextlib.suppress(ValueError):
-            ET.register_namespace(prefix.decode(), uri.decode())
-    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return _restore_namespace_decls(data, namespaces)
-
-
-def _root_namespace_decls(xml: bytes) -> dict[bytes, bytes]:
-    start = _root_tag_start(xml)
-    tag_end = xml.find(b">", start)
-    if start == -1 or tag_end == -1:
-        return {}
-    return dict(XMLNS_RE.findall(xml[start:tag_end]))
-
-
-def _restore_namespace_decls(xml: bytes, namespaces: dict[bytes, bytes]) -> bytes:
-    start = _root_tag_start(xml)
-    tag_end = xml.find(b">", start)
-    if start == -1 or tag_end == -1:
-        return xml
-    name_end = start + 1
-    while name_end < tag_end and xml[name_end] not in b" \t\n\r>/":
-        name_end += 1
-    present = {prefix for prefix, _ in XMLNS_RE.findall(xml[start:tag_end])}
-    missing = b"".join(
-        b' xmlns:%s="%s"' % (prefix, uri) if prefix else b' xmlns="%s"' % uri
-        for prefix, uri in namespaces.items()
-        if prefix not in present
-    )
-    if not missing:
-        return xml
-    return xml[:name_end] + missing + xml[name_end:]
-
-
-def _root_tag_start(xml: bytes) -> int:
-    start = xml.find(b"<")
-    if start != -1 and xml[start : start + 2] == b"<?":
-        return xml.find(b"<", xml.find(b"?>", start) + 2)
-    return start
+def _paragraph_text(p: Paragraph) -> str:
+    return "".join(r.text for r in p.runs)

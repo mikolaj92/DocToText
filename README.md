@@ -11,11 +11,10 @@ round-trips across plain text files, DOCX files, and text-layer PDFs.
 Early library. The public API is small, but not stable yet.
 
 ## Supported Formats
-
 | Format | Read | Write | Notes |
 | --- | --- | --- | --- |
 | TXT/Markdown/text files | yes | same text format when known | Decodes UTF-8, UTF-16, CP1250, and Latin-1 fallback. |
-| DOCX | yes | DOCX | Edits WordprocessingML text nodes in place inside the package. |
+| DOCX | yes | DOCX | High-fidelity editing powered by `python-docx` (the standard library for Microsoft's .docx format). Stable `container_id` + `paragraph_index`, whole-segment and offset-based partial replacements with run splitting. |
 | PDF | text layer only | PDF | Patches original pages when edits fit; rebuilds the PDF as flowing text when edits require reflow. OCR is not bundled. |
 
 `load_document` detects the document kind from bytes first, then falls back to
@@ -127,32 +126,45 @@ uv run pytest
 
 MIT
 
-## High-fidelity DOCX editing
+## High-fidelity DOCX editing (v0.3.0+)
 
-For advanced use cases (reversible redaction, reinjection, structured plans):
+DocToText 0.3.0+ uses `python-docx` (the standard, mature library for Microsoft's .docx / WordprocessingML format) as its internal DOCX engine. This gives proper run-level editing, formatting preservation, and reliable roundtrips.
+
+Key features:
+- Stable `container_id` (e.g. `"body:p:0"`, `"header:0"`, `"table:0:r:0:c:0:p:0"`) and `paragraph_index`.
+- `SegmentReplacement` for structured edits (full segment or sub-range by character offsets).
+- `apply_replacements(..., strict=True)` — fail-closed on unknown targets or bad offsets.
+- Run splitting for partial replacements inside paragraphs (keeps surrounding run formatting where possible).
+- Backward compatible: `apply_texts([...])`, `apply_markdown(...)`, and legacy dict form still work.
+
+Example with offsets (similar to `WriteTarget` style used in Temida/Posejdon):
 
 ```python
-from doctotext import DocxDocument
+from doctotext import DocxDocument, SegmentReplacement
 
 doc = DocxDocument.open("input.docx")
 
-# Stable container addressing
 print([s.container_id for s in doc.segments])
 # ['body:p:0', 'body:p:1', 'header:0', ...]
 
-# Structured replacement using container_id (preferred)
+# Partial replacement inside a segment (character offsets)
 doc.apply_replacements([
-    {"container_id": "body:p:0", "text": "New first paragraph"},
+    SegmentReplacement(
+        container_id="body:p:0",
+        text="REDACTED",
+        start_offset=6,
+        end_offset=12,
+    )
 ], strict=True)
 
-# Or by internal id
+# Or full segment by id
 doc.apply_replacements([
-    {"id": "s0", "text": "Replacement"},
+    {"id": "s1", "text": "New second paragraph"},
 ], strict=True)
 
 doc.save_docx("output.docx")
 ```
 
-`apply_replacements(..., strict=True)` will raise on unknown targets or structural drift.
+`apply_replacements(..., strict=True)` raises on unknown targets or structural drift.
 
-Existing `apply_texts` and `apply_markdown` remain supported.
+Legacy paths (`apply_texts`, `apply_markdown`, whole-segment dicts) remain supported for simple cases (e.g. anonimizator3000-style flows).
