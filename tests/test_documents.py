@@ -12,7 +12,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from test_docx import write_docx
 
-from doctotext import (
+from docxtor import (
     DOCX_MIME,
     MD_MIME,
     PDF_MIME,
@@ -85,7 +85,7 @@ def _unicode_font_name() -> str:
     if font_path is None:
         pytest.skip("Unicode font unavailable for PDF fixture")
 
-    font_name = "DocToTextTestUnicode"
+    font_name = "DocxtorTestUnicode"
     if font_name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(font_name, font_path))
     return font_name

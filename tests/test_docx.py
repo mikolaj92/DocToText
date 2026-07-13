@@ -9,7 +9,7 @@ from docx import Document as PyDocxDocument
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
-from doctotext import (
+from docxtor import (
     DocxDocument,
     InlineSegment,
     InlineSegmentKind,

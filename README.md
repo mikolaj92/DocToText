@@ -1,9 +1,9 @@
-# DocToText
+# Docxtor
 
 Extract editable text segments from documents, modify them in memory, and write
 the changed text back as document bytes.
 
-DocToText is useful when you need one small interface for document text
+Docxtor is useful when you need one small interface for document text
 round-trips across plain text files, DOCX files, and text-layer PDFs.
 
 ## Status
@@ -25,19 +25,19 @@ MIME type and file extension.
 From GitHub:
 
 ```bash
-python -m pip install git+https://github.com/mikolaj92/DocToText.git
+python -m pip install git+https://github.com/mikolaj92/Docxtor.git
 ```
 
 With `uv`:
 
 ```bash
-uv add git+https://github.com/mikolaj92/DocToText.git
+uv add git+https://github.com/mikolaj92/Docxtor.git
 ```
 
 ## Basic Usage
 
 ```python
-from doctotext import DOCX_MIME, document_to_bytes, load_document
+from docxtor import DOCX_MIME, document_to_bytes, load_document
 
 document = load_document("input.docx", DOCX_MIME, input_bytes)
 
@@ -65,7 +65,7 @@ document.apply_texts([...])
 ## Type Detection
 
 ```python
-from doctotext import DocumentKind, detect_document_type
+from docxtor import DocumentKind, detect_document_type
 
 detection = detect_document_type(
     "upload.bin",
@@ -83,12 +83,12 @@ DOCX documents can be exported to marker-based Markdown, edited, then applied
 back to the original document structure.
 
 ```python
-from doctotext import DocxDocument
+from docxtor import DocxDocument
 
 document = DocxDocument.open("input.docx")
 markdown = document.to_markdown()
 
-# Keep doctotext markers intact.
+# Keep docxtor markers intact.
 edited_markdown = markdown.replace("old", "new")
 
 document.apply_markdown(edited_markdown)
@@ -119,7 +119,7 @@ uv run pytest
   original pages.
 - PDF edits that insert text, expand replacements, or need reflow rebuild the
   PDF as flowing text. Page count may shrink or grow.
-- If changed PDF text cannot be located safely, DocToText fails closed for that
+- If changed PDF text cannot be located safely, Docxtor fails closed for that
   page by rebuilding the page text instead of leaking the original text.
 
 ## License
@@ -128,7 +128,7 @@ MIT
 
 ## Sole mechanical DOCX layer (v0.3.0+)
 
-**DocToText is the single source of truth for mechanical DOCX manipulation.**
+**Docxtor is the single source of truth for mechanical DOCX manipulation.**
 
 It owns:
 - stable addressing (`container_id`, global `paragraph_index` counting empties)
@@ -137,11 +137,11 @@ It owns:
 - mutation (`apply_targets`, `apply_replacements`, `replace_placeholder`)
 - access and rebuild (`get_inline_segments`, `paragraph_to_inline_segments`, `rebuild_paragraph_from_inline`)
 
-Reviewkit (and Dike via it) delegates base paragraph/run/offset work to DocToText and only layers review semantics (tracked changes as decision trace, comments, `apply_to_corrected`, `RenderIntegrityError`, policy, purity).
+Reviewkit (and Dike via it) delegates base paragraph/run/offset work to Docxtor and only layers review semantics (tracked changes as decision trace, comments, `apply_to_corrected`, `RenderIntegrityError`, policy, purity).
 
 Temida consumers (posejdon_docs, dike_docs, anonimizator3000, ...) are thin adapters or high-level users. They contain **no** custom run splitting, offset math, or paragraph-mutation logic.
 
-DocToText 0.3.0+ uses `python-docx` (the standard, mature library for Microsoft's .docx / WordprocessingML format) as its internal DOCX engine.
+Docxtor 0.3.0+ uses `python-docx` (the standard, mature library for Microsoft's .docx / WordprocessingML format) as its internal DOCX engine.
 
 Key features:
 - Stable `container_id` (e.g. `"body:p:0"`, `"header:0"`, `"table:0:r:0:c:0:p:0"`) and `paragraph_index`.
@@ -153,7 +153,7 @@ Key features:
 Example with offsets (similar to `WriteTarget` style used in Temida/Posejdon):
 
 ```python
-from doctotext import DocxDocument, SegmentReplacement
+from docxtor import DocxDocument, SegmentReplacement
 
 doc = DocxDocument.open("input.docx")
 

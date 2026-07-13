@@ -101,8 +101,8 @@ wheels = [
 ]
 
 [[package]]
-name = "doctotext"
-version = "0.3.0"
+name = "docxtor"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "pymupdf" },

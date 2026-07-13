@@ -519,7 +519,7 @@ class DocxDocument:
                 normalized.append(d)
         self.apply_replacements(normalized, strict=strict)
     def to_markdown(self) -> str:
-        blocks = [f"<!-- doctotext:{s.id} -->\n{s.text}" for s in self._segments]
+        blocks = [f"<!-- docxtor:{s.id} -->\n{s.text}" for s in self._segments]
         return "\n\n".join(blocks)
 
     def get_indexed_paragraphs(self) -> list[tuple[int, str, Paragraph]]:
@@ -635,7 +635,7 @@ class DocxDocument:
         import re as _re
         by_id = {
             m.group("id"): m.group("text").rstrip("\n")
-            for m in _re.finditer(r"<!-- doctotext:(?P<id>s\d+) -->\n(?P<text>.*?)(?=\n<!-- doctotext:s\d+ -->\n|\Z)", markdown, _re.DOTALL)
+            for m in _re.finditer(r"<!-- docxtor:(?P<id>s\d+) -->\n(?P<text>.*?)(?=\n<!-- docxtor:s\d+ -->\n|\Z)", markdown, _re.DOTALL)
         }
         if strict:
             expected = {s.id for s in self._segments}

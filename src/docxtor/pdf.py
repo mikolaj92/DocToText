@@ -594,7 +594,7 @@ def _text_insert_kwargs() -> dict:
     font_path = _unicode_font_path()
     if font_path:
         kwargs["fontfile"] = font_path
-        kwargs["fontname"] = "doctotextunicode"
+        kwargs["fontname"] = "docxtorunicode"
     return kwargs
 
 

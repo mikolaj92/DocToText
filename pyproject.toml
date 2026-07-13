@@ -1,12 +1,12 @@
 [project]
-name = "doctotext"
+name = "docxtor"
 version = "0.4.0"
 description = "Extract editable text segments from documents and inject changed text back in memory."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-  { name = "DocToText contributors" }
+  { name = "Docxtor contributors" }
 ]
 dependencies = [
   "pymupdf>=1.24",
