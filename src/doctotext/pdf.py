@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -16,6 +17,7 @@ A4_HEIGHT = 842
 PAGE_MARGIN = 48
 TEXT_FONT_SIZE = 10
 TEXT_LINE_HEIGHT = 12.5
+_DIFF_TOKEN = re.compile(r"\s+|\S+")
 UNICODE_FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -188,9 +190,9 @@ def _redact_page_changes_by_offsets(
         source = change.source_text.strip()
         if not source:
             continue
-        if _unsafe_short_redaction_source(source):
-            return False
-
+        # Offset-based rects are exact character positions, so even a one-character
+        # source (initials, a single digit) is unambiguous here and safe to redact in
+        # place. Bailing to a full-page re-render instead corrupts every other line.
         rects = _rects_for_source_range(
             source_text,
             char_rects,
@@ -218,17 +220,61 @@ def _redact_page_changes_by_offsets(
 
 
 def _changed_text_spans(source_text: str, anonymized_text: str) -> list[_TextChange]:
-    matcher = SequenceMatcher(None, source_text, anonymized_text, autojunk=False)
+    # Diff at word granularity (runs of whitespace / non-whitespace) rather than per
+    # character. A character-level diff finds coincidental shared characters between a
+    # PII span and its placeholder (e.g. "Adres 41" vs "[ADRES_1]" share "A" and "1"),
+    # fragmenting one replacement into several partial spans that redact into broken
+    # labels. Whole words do not match coincidentally, so each PII span maps to one
+    # complete placeholder and keeps a wide-enough box for the label to fit in place.
+    source_tokens = [m.span() for m in _DIFF_TOKEN.finditer(source_text)]
+    anon_tokens = [m.span() for m in _DIFF_TOKEN.finditer(anonymized_text)]
+    matcher = SequenceMatcher(
+        None,
+        [source_text[start:end] for start, end in source_tokens],
+        [anonymized_text[start:end] for start, end in anon_tokens],
+        autojunk=False,
+    )
     changes: list[_TextChange] = []
     for tag, source_start, source_end, replacement_start, replacement_end in matcher.get_opcodes():
         if tag in {"equal", "insert"}:
             continue
+        char_start = source_tokens[source_start][0]
+        char_end = source_tokens[source_end - 1][1]
+        if replacement_end > replacement_start:
+            replacement_text = anonymized_text[
+                anon_tokens[replacement_start][0] : anon_tokens[replacement_end - 1][1]
+            ]
+        else:
+            replacement_text = ""
+        source_value = source_text[char_start:char_end]
+        # Trim characters the source and replacement share at the edges (matched quotes,
+        # brackets, punctuation) so the redaction box and the placeholder cover only the
+        # part that actually changed. This keeps the placeholder ASCII-clean — e.g.
+        # „Paweł” -> „[OSOBA_3]” becomes Paweł -> [OSOBA_3], instead of masking the whole
+        # quoted token because of the non-ASCII quotation marks.
+        prefix = 0
+        while (
+            prefix < len(source_value)
+            and prefix < len(replacement_text)
+            and source_value[prefix] == replacement_text[prefix]
+        ):
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < len(source_value) - prefix
+            and suffix < len(replacement_text) - prefix
+            and source_value[-1 - suffix] == replacement_text[-1 - suffix]
+        ):
+            suffix += 1
+        char_start += prefix
+        char_end -= suffix
+        replacement_text = replacement_text[prefix : len(replacement_text) - suffix]
         changes.append(
             _TextChange(
-                source_start=source_start,
-                source_end=source_end,
-                source_text=source_text[source_start:source_end],
-                replacement_text=anonymized_text[replacement_start:replacement_end],
+                source_start=char_start,
+                source_end=char_end,
+                source_text=source_text[char_start:char_end],
+                replacement_text=replacement_text,
             )
         )
     return changes
@@ -266,8 +312,15 @@ def _requires_page_text_rebuild(source_text: str, target_text: str) -> bool:
     return False
 
 
+_LABEL_PLACEHOLDER = re.compile(r"\[[A-ZĄĆĘŁŃÓŚŹŻ][A-ZĄĆĘŁŃÓŚŹŻ0-9_]*\]")
+
+
 def _looks_like_redaction_target(text: str) -> bool:
-    return "****" in text or ("<" in text and ">" in text)
+    return (
+        "****" in text
+        or ("<" in text and ">" in text)
+        or _LABEL_PLACEHOLDER.search(text) is not None
+    )
 
 
 def _replacement_requires_reflow(
@@ -483,7 +536,10 @@ def _render_text_pdf(pages: list[str]) -> bytes:
 
 
 def _render_reflowed_text_pdf(pages: list[str]) -> bytes:
-    text = "\n".join(page.rstrip("\n") for page in pages)
+    # Separate pages with a form feed so each original page is reflowed within its
+    # own page boundary (growing onto extra pages only on overflow) instead of being
+    # merged into one continuous stream, which collapsed the document's page count.
+    text = "\f".join(page.rstrip("\n") for page in pages)
     return _render_flowing_text_pdf(text)
 
 
