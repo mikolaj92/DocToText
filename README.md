@@ -126,9 +126,22 @@ uv run pytest
 
 MIT
 
-## High-fidelity DOCX editing (v0.3.0+)
+## Sole mechanical DOCX layer (v0.3.0+)
 
-DocToText 0.3.0+ uses `python-docx` (the standard, mature library for Microsoft's .docx / WordprocessingML format) as its internal DOCX engine. This gives proper run-level editing, formatting preservation, and reliable roundtrips.
+**DocToText is the single source of truth for mechanical DOCX manipulation.**
+
+It owns:
+- stable addressing (`container_id`, global `paragraph_index` counting empties)
+- rich decomposition (`InlineSegment` with text + opaque, `rpr`, original element)
+- pure offset primitives (`_split_visible_offset`, `_insert_visible`, `_replace_visible_range`, `_rpr_at`, `_visible_text`, ...)
+- mutation (`apply_targets`, `apply_replacements`, `replace_placeholder`)
+- access and rebuild (`get_inline_segments`, `paragraph_to_inline_segments`, `rebuild_paragraph_from_inline`)
+
+Reviewkit (and Dike via it) delegates base paragraph/run/offset work to DocToText and only layers review semantics (tracked changes as decision trace, comments, `apply_to_corrected`, `RenderIntegrityError`, policy, purity).
+
+Temida consumers (posejdon_docs, dike_docs, anonimizator3000, ...) are thin adapters or high-level users. They contain **no** custom run splitting, offset math, or paragraph-mutation logic.
+
+DocToText 0.3.0+ uses `python-docx` (the standard, mature library for Microsoft's .docx / WordprocessingML format) as its internal DOCX engine.
 
 Key features:
 - Stable `container_id` (e.g. `"body:p:0"`, `"header:0"`, `"table:0:r:0:c:0:p:0"`) and `paragraph_index`.

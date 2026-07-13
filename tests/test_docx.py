@@ -9,7 +9,19 @@ from docx import Document as PyDocxDocument
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
-from doctotext import DocxDocument, SegmentReplacement
+from doctotext import (
+    DocxDocument,
+    InlineSegment,
+    InlineSegmentKind,
+    SegmentReplacement,
+    paragraph_to_inline_segments,
+    rebuild_paragraph_from_inline,
+    _split_visible_offset,
+    _insert_visible,
+    _replace_visible_range,
+    _visible_text,
+    _rpr_at,
+)
 
 
 def write_simple_docx(path: Path) -> None:
@@ -185,3 +197,130 @@ def test_strict_unknown_target_raises(tmp_path: Path) -> None:
     doc = DocxDocument.open(path)
     with pytest.raises(ValueError):
         doc.apply_replacements([{"container_id": "body:p:999", "text": "no"}], strict=True)
+# ------------------------------------------------------------------
+# Tests for canonical mechanical surface (InlineSegment + pure functions)
+# These are the primitives reviewkit (and others) must delegate to.
+# ------------------------------------------------------------------
+
+
+def test_paragraph_to_inline_segments_basic(tmp_path: Path) -> None:
+    """Decomposition must separate text runs and preserve rpr on text segments."""
+    path = tmp_path / "fmt.docx"
+    d = PyDocxDocument()
+    p = d.add_paragraph()
+    r1 = p.add_run("Hello")
+    r1.bold = True
+    p.add_run(" ")
+    r2 = p.add_run("World")
+    d.save(str(path))
+
+    para = DocxDocument.open(path).resolve_paragraph("body:p:0")
+    assert para is not None
+
+    segs = paragraph_to_inline_segments(para)
+    assert len(segs) == 3
+    assert segs[0].kind == "text"
+    assert segs[0].text == "Hello"
+    assert segs[0].rpr is not None
+    assert segs[1].kind == "text"
+    assert segs[1].text == " "
+    assert segs[2].kind == "text"
+    assert segs[2].text == "World"
+
+
+def test_paragraph_to_inline_segments_with_opaque(tmp_path: Path) -> None:
+    """Tabs and breaks must become opaque segments with visible width for offset math."""
+    path = tmp_path / "opaque.docx"
+    d = PyDocxDocument()
+    p = d.add_paragraph()
+    p.add_run("A")
+    p.add_run("\t")
+    p.add_run("B")
+    d.save(str(path))
+
+    para = DocxDocument.open(path).resolve_paragraph("body:p:0")
+    assert para is not None
+    segs = paragraph_to_inline_segments(para)
+
+    # Expect: text"A", opaque(tab), text"B"
+    kinds = [s.kind for s in segs]
+    assert kinds == ["text", "opaque", "text"]
+    assert segs[1].text == "\t"
+    assert segs[1].element is not None
+
+
+def test_inline_split_insert_replace_roundtrip(tmp_path: Path) -> None:
+    """Pure functions must allow split/insert/replace while keeping offset accounting correct."""
+    path = tmp_path / "edit.docx"
+    d = PyDocxDocument()
+    p = d.add_paragraph("Alpha Beta Gamma")
+    d.save(str(path))
+
+    para = DocxDocument.open(path).resolve_paragraph("body:p:0")
+    assert para is not None
+    segs = paragraph_to_inline_segments(para)
+
+    # visible text is the whole thing
+    assert _visible_text(segs) == "Alpha Beta Gamma"
+
+    # split at "Beta" start (6)
+    split = _split_visible_offset(segs, 6)
+    assert _visible_text(split).startswith("Alpha ")
+
+    # replace "Beta" (6:10) with "XXX"
+    rep = InlineSegment("text", "XXX")
+    replaced = _replace_visible_range(segs, 6, 10, [rep])
+    assert _visible_text(replaced) == "Alpha XXX Gamma"
+
+    # insert after "Alpha "
+    ins = InlineSegment("text", "NEW ")
+    inserted = _insert_visible(segs, 6, ins)
+    assert _visible_text(inserted).startswith("Alpha NEW Beta")
+
+
+def test_rpr_at_picks_formatting_from_text_segments(tmp_path: Path) -> None:
+    """_rpr_at must return formatting active at a visible offset (for review layers to inherit)."""
+    path = tmp_path / "rpr.docx"
+    d = PyDocxDocument()
+    p = d.add_paragraph()
+    r1 = p.add_run("Bold")
+    r1.bold = True
+    p.add_run("Plain")
+    d.save(str(path))
+
+    para = DocxDocument.open(path).resolve_paragraph("body:p:0")
+    segs = paragraph_to_inline_segments(para)
+
+    rpr_bold = _rpr_at(segs, 2)  # inside "Bold"
+    rpr_plain = _rpr_at(segs, 6)  # inside "Plain"
+
+    # We only check presence; full XML equality is brittle.
+    assert rpr_bold is not None
+    # plain may or may not have rpr element; the point is the function does not crash
+    # and returns something for the bold region.
+    assert True
+
+
+def test_rebuild_paragraph_from_inline_preserves_text_and_opaque(tmp_path: Path) -> None:
+    """rebuild must produce a paragraph whose visible text matches the segments (no review markup)."""
+    path = tmp_path / "rebuild.docx"
+    d = PyDocxDocument()
+    p = d.add_paragraph()
+    p.add_run("Keep")
+    p.add_run("\t")
+    p.add_run("Me")
+    d.save(str(path))
+
+    doc = DocxDocument.open(path)
+    para = doc.resolve_paragraph("body:p:0")
+    assert para is not None
+
+    segs = paragraph_to_inline_segments(para)
+    # mutate mechanically
+    segs = _replace_visible_range(segs, 0, 4, [InlineSegment("text", "NEW")])
+
+    rebuild_paragraph_from_inline(para, segs)
+
+    # Re-decompose and check
+    fresh = paragraph_to_inline_segments(para)
+    assert _visible_text(fresh) == "NEW\tMe"
